@@ -33,7 +33,11 @@ use crate::{
     PlanProperties, ReplaceChildrenOptions, Statistics, validate_child_count,
 };
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{
+    Array, AsArray, PrimitiveArray, RecordBatch, RecordBatchOptions, UInt64Array,
+    downcast_primitive_array,
+};
+use arrow::buffer::Buffer;
 use arrow::compute::take_arrays;
 use arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
 use arrow_schema::SortOptions;
@@ -41,6 +45,7 @@ use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::utils::transpose;
 use datafusion_common::{
     ColumnStatistics, DataFusionError, HashMap, SplitPoint, assert_or_internal_err,
@@ -143,8 +148,10 @@ use distributor_channels::{
 /// the state machine that handles reading these batches.
 #[derive(Debug)]
 enum RepartitionBatch {
-    /// Batch held in memory (counts against memory reservation)
-    Memory(RecordBatch),
+    /// Batch held in memory (counts against memory reservation), together with
+    /// the number of bytes reserved for it. The size is computed once at send
+    /// and released exactly on receive.
+    Memory(RecordBatch, usize),
     /// Marker indicating a batch was spilled to the partition's SpillPool.
     /// The actual batch can be retrieved by reading from the SpillPoolStream.
     /// This variant contains no data itself - it's just a signal to the reader
@@ -199,6 +206,120 @@ impl PartitionSpillWriters {
     }
 }
 
+/// Bytes to reserve in the memory pool for `batch` while it sits in a channel.
+///
+/// For a batch whose buffers each own their allocation this is exactly
+/// `RecordBatch::get_array_memory_size`, at that function's cost: nothing changes
+/// for such batches.
+///
+/// `get_array_memory_size` counts a shared allocation once per array viewing it.
+/// That over-counts by the buffer count for batches whose buffers are all slices
+/// of one allocation (e.g. read back through Arrow IPC, whose reader slices every
+/// buffer out of one message body) and makes them spill although they fit. Only
+/// when [`may_share_allocation`] spots such a slice do we count each allocation
+/// once via `get_record_batch_memory_size`, adding back each array object's own
+/// overhead (`get_array_memory_size - get_buffer_memory_size`, recursive for
+/// nested types), which that helper drops although the batch retains it.
+fn batch_memory_size(batch: &RecordBatch) -> usize {
+    if batch
+        .columns()
+        .iter()
+        .any(|c| may_share_allocation(c.as_ref()))
+    {
+        get_record_batch_memory_size(batch)
+            + batch
+                .columns()
+                .iter()
+                .map(|c| {
+                    c.get_array_memory_size()
+                        .saturating_sub(c.get_buffer_memory_size())
+                })
+                .sum::<usize>()
+    } else {
+        batch.get_array_memory_size()
+    }
+}
+
+/// Whether a buffer starts inside its allocation, i.e. is a slice of a larger one.
+///
+/// Two buffers can only share an allocation if at most one of them starts at its
+/// beginning, so any batch whose buffers are slices of one allocation (the IPC
+/// reader case) has at least one such buffer unless it holds a single buffer, in
+/// which case there is nothing to double count. Capacity versus length is not
+/// used: builders over-allocate (`MutableBuffer` doubles), so it would fire on
+/// fresh batches and says nothing the start pointer does not.
+fn buffer_is_slice(buffer: &Buffer) -> bool {
+    buffer.as_ptr() != buffer.data_ptr().as_ptr().cast_const()
+}
+
+/// Whether any buffer of `array` or its children is a slice of a larger allocation.
+///
+/// Walks the typed arrays without `to_data()` (which allocates per array). Types
+/// it does not know answer `true`, which only selects the slower, still correct
+/// path in [`batch_memory_size`].
+fn may_share_allocation(array: &dyn Array) -> bool {
+    if array.nulls().is_some_and(|n| buffer_is_slice(n.buffer())) {
+        return true;
+    }
+    downcast_primitive_array! {
+        array => buffer_is_slice(array.values().inner()),
+        DataType::Null => false,
+        DataType::Boolean => buffer_is_slice(array.as_boolean().values().inner()),
+        DataType::Utf8 => {
+            let a = array.as_string::<i32>();
+            buffer_is_slice(a.offsets().inner().inner()) || buffer_is_slice(a.values())
+        }
+        DataType::LargeUtf8 => {
+            let a = array.as_string::<i64>();
+            buffer_is_slice(a.offsets().inner().inner()) || buffer_is_slice(a.values())
+        }
+        DataType::Binary => {
+            let a = array.as_binary::<i32>();
+            buffer_is_slice(a.offsets().inner().inner()) || buffer_is_slice(a.values())
+        }
+        DataType::LargeBinary => {
+            let a = array.as_binary::<i64>();
+            buffer_is_slice(a.offsets().inner().inner()) || buffer_is_slice(a.values())
+        }
+        DataType::Utf8View => {
+            let a = array.as_string_view();
+            buffer_is_slice(a.views().inner()) || a.data_buffers().iter().any(buffer_is_slice)
+        }
+        DataType::BinaryView => {
+            let a = array.as_binary_view();
+            buffer_is_slice(a.views().inner()) || a.data_buffers().iter().any(buffer_is_slice)
+        }
+        DataType::FixedSizeBinary(_) => {
+            buffer_is_slice(array.as_fixed_size_binary().values())
+        }
+        DataType::List(_) => {
+            let a = array.as_list::<i32>();
+            buffer_is_slice(a.offsets().inner().inner()) || may_share_allocation(a.values().as_ref())
+        }
+        DataType::LargeList(_) => {
+            let a = array.as_list::<i64>();
+            buffer_is_slice(a.offsets().inner().inner()) || may_share_allocation(a.values().as_ref())
+        }
+        DataType::FixedSizeList(_, _) => {
+            may_share_allocation(array.as_fixed_size_list().values().as_ref())
+        }
+        DataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .any(|c| may_share_allocation(c.as_ref())),
+        DataType::Dictionary(_, _) => {
+            let a = array.as_any_dictionary();
+            may_share_allocation(a.keys()) || may_share_allocation(a.values().as_ref())
+        }
+        DataType::Map(_, _) => {
+            let a = array.as_map();
+            buffer_is_slice(a.offsets().inner().inner()) || may_share_allocation(a.entries())
+        }
+        _ => true,
+    }
+}
+
 impl OutputChannel {
     /// Appends the batches that are ready to send to `out`.
     fn coalesce(&mut self, batch: RecordBatch, out: &mut Vec<RecordBatch>) -> Result<()> {
@@ -217,13 +338,18 @@ impl OutputChannel {
     ///
     /// Used after [`OutputChannel::coalesce`] for performance purposes.
     async fn send(&mut self, batch: RecordBatch) -> Result<(), SendError<MaybeBatch>> {
-        let size = batch.get_array_memory_size();
+        // Count each shared buffer once (`get_array_memory_size` counts it once
+        // per array viewing it, e.g. every column of a batch read from Arrow IPC),
+        // while still charging each array object's own overhead, which the batch
+        // really retains (see `batch_memory_size`). Computed once and carried with
+        // the batch.
+        let size = batch_memory_size(&batch);
 
         // Decide the payload outside of any await: never hold a MutexGuard
         // across an await point.
         let (payload, is_memory_batch) = {
             match self.reservation.try_grow(size) {
-                Ok(_) => (Ok(RepartitionBatch::Memory(batch)), true),
+                Ok(_) => (Ok(RepartitionBatch::Memory(batch, size)), true),
                 Err(_) => match self.spill_writer.push_batch(&batch) {
                     Ok(()) => (Ok(RepartitionBatch::Spilled), false),
                     Err(err) => (Err(err), false),
@@ -2559,9 +2685,9 @@ impl PerPartitionStream {
 
                     match value {
                         Some(Some(v)) => match v {
-                            Ok(RepartitionBatch::Memory(batch)) => {
-                                // Release memory and return batch
-                                self.reservation.shrink(batch.get_array_memory_size());
+                            Ok(RepartitionBatch::Memory(batch, size)) => {
+                                // Release exactly what `send` reserved
+                                self.reservation.shrink(size);
                                 return Poll::Ready(Some(Ok(batch)));
                             }
                             Ok(RepartitionBatch::Spilled) => {
@@ -5302,6 +5428,256 @@ mod test {
         let spilled_rows = metrics.spilled_rows().unwrap_or(0);
         assert!(spilled_rows > 0);
 
+        Ok(())
+    }
+
+    /// A batch read back through Arrow IPC must be reserved by its real size.
+    /// IPC readers slice every buffer of an uncompressed batch out of one message
+    /// allocation, so per-array sizing (`get_array_memory_size`) over-counts by the
+    /// buffer count and spills a batch that fits (see arrow-rs#6439).
+    #[tokio::test]
+    async fn test_ipc_read_batch_not_spilled() -> Result<()> {
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::ipc::reader::FileReader;
+        use arrow::ipc::writer::FileWriter;
+        use datafusion_execution::config::SessionConfig;
+        use datafusion_execution::memory_pool::FairSpillPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use std::io::Cursor;
+
+        const ROWS: usize = 8192;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+            Field::new("c", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let written = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..ROWS as i64)),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..ROWS).map(|i| i as f64 * 0.5),
+                )),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..ROWS).map(|i| i as f64 * 2.0),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS as i64).map(|i| i * 3),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..ROWS).map(|i| format!("name-{i}")),
+                )),
+            ],
+        )?;
+
+        let mut bytes = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut bytes, &schema)?;
+            writer.write(&written)?;
+            writer.finish()?;
+        }
+        let batch = FileReader::try_new(Cursor::new(bytes), None)?
+            .next()
+            .unwrap()?;
+        assert_eq!(batch.num_rows(), ROWS);
+
+        let dedup = batch_memory_size(&batch);
+        let overcount = batch.get_array_memory_size();
+        assert!(overcount > 3 * dedup, "{overcount} vs {dedup}");
+
+        // A pool between the two sizes: fits only if counted once.
+        let pool_size = dedup * 2;
+        assert!(pool_size < overcount);
+        let runtime = RuntimeEnvBuilder::default()
+            .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_runtime(runtime)
+                .with_session_config(SessionConfig::new().with_batch_size(1024)),
+        );
+
+        let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+        let exec = RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(1))?;
+        let stream = exec.execute(0, Arc::clone(&task_ctx))?;
+        let batches: Vec<_> = stream.try_collect().await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS);
+
+        let metrics = exec.metrics().unwrap();
+        assert_eq!(metrics.spill_count().unwrap_or(0), 0);
+        // All reservations are released once the stream is drained.
+        assert_eq!(task_ctx.runtime_env().memory_pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// Guard for `batch_memory_size` on every array shape: fresh builder batches take
+    /// the fast path and report exactly `get_array_memory_size`; after an Arrow IPC
+    /// round trip (all buffers slices of one allocation) it takes the dedup path
+    /// and equals the identity-set based `count_batch_with_array_overhead`.
+    #[test]
+    fn test_batch_size_formula_matches_array_overhead_counter() -> Result<()> {
+        use arrow::array::{
+            Array, ArrayRef, BinaryViewArray, DictionaryArray, FixedSizeListArray,
+            Float64Array, Int8Array, Int32Array, Int64Array, LargeListArray, ListArray,
+            MapArray, StringArray, StringViewArray, StructArray,
+        };
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+        use arrow::datatypes::Int8Type;
+        use arrow::ipc::reader::FileReader;
+        use arrow::ipc::writer::FileWriter;
+        use datafusion_common::utils::memory::RecordBatchMemoryCounter;
+        use std::io::Cursor;
+
+        const N: usize = 64;
+        let ints = || Int32Array::from_iter_values(0..N as i32);
+        let long_str = |i: usize| format!("a fairly long string value number {i}");
+
+        let struct_arr = StructArray::try_new(
+            vec![
+                Field::new("x", DataType::Int32, false),
+                Field::new("y", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(ints()) as ArrayRef,
+                Arc::new(StringArray::from_iter(
+                    (0..N).map(|i| (i % 3 != 0).then(|| long_str(i))),
+                )) as ArrayRef,
+            ],
+            Some(NullBuffer::from_iter((0..N).map(|i| i % 5 != 0))),
+        )?;
+        let list_arr = ListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(2, N)),
+            Arc::new(Int32Array::from_iter_values(0..2 * N as i32)),
+            Some(NullBuffer::from_iter((0..N).map(|i| i % 7 != 0))),
+        )?;
+        let large_list_arr = LargeListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(2, N)),
+            Arc::new(Int32Array::from_iter_values(0..2 * N as i32)),
+            None,
+        )?;
+        let fsl_arr = FixedSizeListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            2,
+            Arc::new(Int32Array::from_iter_values(0..2 * N as i32)),
+            Some(NullBuffer::from_iter((0..N).map(|i| i % 4 != 0))),
+        )?;
+        let dict_arr = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from_iter_values((0..N).map(|i| (i % 4) as i8)),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+        )?;
+        let sv_arr =
+            StringViewArray::from_iter((0..N).map(|i| (i % 6 != 0).then(|| long_str(i))));
+        let bv_arr = BinaryViewArray::from_iter(
+            (0..N).map(|i| (i % 6 != 0).then(|| long_str(i).into_bytes())),
+        );
+        let entries = StructArray::try_new(
+            vec![
+                Field::new("keys", DataType::Int32, false),
+                Field::new("values", DataType::Int64, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(ints()) as ArrayRef,
+                Arc::new(Int64Array::from_iter(
+                    (0..N as i64).map(|i| (i % 2 == 0).then_some(i)),
+                )) as ArrayRef,
+            ],
+            None,
+        )?;
+        let map_arr = MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(1, N)),
+            entries,
+            None,
+            false,
+        )?;
+        let nullable =
+            Float64Array::from_iter((0..N).map(|i| (i % 3 != 0).then_some(i as f64)));
+
+        let cases: Vec<(&str, ArrayRef)> = vec![
+            ("struct", Arc::new(struct_arr)),
+            ("list", Arc::new(list_arr)),
+            ("large_list", Arc::new(large_list_arr)),
+            ("fixed_size_list", Arc::new(fsl_arr)),
+            ("dictionary", Arc::new(dict_arr)),
+            ("string_view", Arc::new(sv_arr)),
+            ("binary_view", Arc::new(bv_arr)),
+            ("map", Arc::new(map_arr)),
+            ("nullable_primitive", Arc::new(nullable)),
+        ];
+
+        for (name, array) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "c",
+                array.data_type().clone(),
+                true,
+            )]));
+            let built = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+            let mut bytes = Vec::new();
+            {
+                let mut writer = FileWriter::try_new(&mut bytes, &schema)?;
+                writer.write(&built)?;
+                writer.finish()?;
+            }
+            let read = FileReader::try_new(Cursor::new(bytes), None)?
+                .next()
+                .unwrap()?;
+            // Fresh builder batches own their buffers: fast path, exactly the old size.
+            assert!(
+                !built
+                    .columns()
+                    .iter()
+                    .any(|c| may_share_allocation(c.as_ref())),
+                "{name} (built) must not look shared"
+            );
+            assert_eq!(
+                batch_memory_size(&built),
+                built.get_array_memory_size(),
+                "{name} (built)"
+            );
+            // IPC batches slice every buffer out of one allocation: dedup path, which
+            // must equal the identity-set counter.
+            assert!(
+                read.columns()
+                    .iter()
+                    .any(|c| may_share_allocation(c.as_ref())),
+                "{name} (ipc) must look shared"
+            );
+            assert_eq!(
+                batch_memory_size(&read),
+                RecordBatchMemoryCounter::new().count_batch_with_array_overhead(&read),
+                "{name} (ipc)"
+            );
+            assert!(
+                batch_memory_size(&read) <= read.get_array_memory_size(),
+                "{name} (ipc)"
+            );
+            // Typed arrays slice their buffers, so a sliced batch looks shared and
+            // takes the dedup path; its buffers are still whole allocations, so the
+            // size is the same as before.
+            let sliced = built.slice(10, 20);
+            assert_eq!(
+                batch_memory_size(&sliced),
+                sliced.get_array_memory_size(),
+                "{name} (sliced)"
+            );
+            eprintln!(
+                "SIZES {name:<20} built={} ipc={} ipc_old={} sliced={} sliced_shared={}",
+                batch_memory_size(&built),
+                batch_memory_size(&read),
+                read.get_array_memory_size(),
+                batch_memory_size(&sliced),
+                sliced
+                    .columns()
+                    .iter()
+                    .any(|c| may_share_allocation(c.as_ref())),
+            );
+        }
         Ok(())
     }
 

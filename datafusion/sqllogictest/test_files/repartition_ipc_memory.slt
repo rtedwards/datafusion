@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# RepartitionExec must size batches read from Arrow IPC files by their real
+# memory footprint. The IPC reader slices every buffer of an uncompressed
+# batch out of one message allocation, so per-array sizing over-counts by the
+# buffer count and would spill batches that fit in the memory pool.
+
+statement ok
+SET datafusion.execution.target_partitions = 2
+
+statement ok
+SET datafusion.execution.batch_size = 8192
+
+statement ok
+SET datafusion.optimizer.repartition_file_scans = false
+
+# One 8_192-row batch of five columns (~368 KB deduplicated, ~2.2 MB when each
+# array's view of the shared allocation is counted separately). The file must be
+# uncompressed: compressed buffers are decompressed into separate allocations.
+query I
+COPY (
+  SELECT
+    v AS id,
+    CAST(v AS DOUBLE) * 0.5 AS a,
+    CAST(v AS DOUBLE) * 2.0 AS b,
+    v * 3 AS c,
+    'name-' || CAST(v AS VARCHAR) AS s
+  FROM generate_series(0, 8191) AS t(v)
+) TO 'test_files/scratch/repartition_ipc_memory/data.arrow'
+STORED AS ARROW OPTIONS ('format.compression' 'uncompressed');
+----
+8192
+
+statement ok
+CREATE EXTERNAL TABLE ipc_data
+STORED AS ARROW
+LOCATION 'test_files/scratch/repartition_ipc_memory/data.arrow';
+
+# 1M fits the batch counted once (~368 KB) but not counted per array (~2.2 MB),
+# so a regression to per-array sizing shows up as spill_count > 0 below.
+statement ok
+SET datafusion.runtime.memory_limit = '1M'
+
+query TT
+EXPLAIN ANALYZE SELECT * FROM ipc_data WHERE c >= 0
+----
+Plan with Metrics
+01)FilterExec: c@3 >= 0, metrics=[<slt:ignore>]
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, metrics=[<slt:ignore> spill_count=0, <slt:ignore>]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/repartition_ipc_memory/data.arrow]]}, projection=[id, a, b, c, s], file_type=arrow, metrics=[<slt:ignore>]
+
+statement ok
+RESET datafusion.runtime.memory_limit
+
+statement ok
+RESET datafusion.optimizer.repartition_file_scans
+
+statement ok
+RESET datafusion.execution.batch_size
+
+statement ok
+SET datafusion.execution.target_partitions = 4
+
+statement ok
+DROP TABLE ipc_data
+
+statement ok
+RESET datafusion.catalog.create_default_catalog_and_schema
